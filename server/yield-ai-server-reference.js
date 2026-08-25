@@ -20,10 +20,23 @@
 
 const express = require("express");
 const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const { Pool } = require("pg");
+const { randomUUID } = require("crypto");
 const { GoogleGenAI } = require("@google/genai");
 
 const app = express();
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL
+    ? { rejectUnauthorized: false }
+    : false,
+});
 
+pool.on("error", (err) => {
+  console.error("[yield-auth] Unexpected PostgreSQL pool error:", err);
+});
 /* ----------------------------------------------------------------
    CORS
    The frontend and backend are deployed on separate domains, so the
@@ -46,6 +59,14 @@ const DEV_ORIGINS = [
   "http://127.0.0.1:3000",
   "http://127.0.0.1:5173",
 ];
+
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  console.warn(
+    "[yield-auth] JWT_SECRET is not set. Authentication endpoints will be unavailable."
+  );
+}
 
 const ALLOWED_ORIGINS = process.env.YIELD_FRONTEND_ORIGIN
   ? [process.env.YIELD_FRONTEND_ORIGIN]
