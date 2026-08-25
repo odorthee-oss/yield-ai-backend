@@ -60,14 +60,6 @@ const DEV_ORIGINS = [
   "http://127.0.0.1:5173",
 ];
 
-const JWT_SECRET = process.env.JWT_SECRET;
-
-if (!JWT_SECRET) {
-  console.warn(
-    "[yield-auth] JWT_SECRET is not set. Authentication endpoints will be unavailable."
-  );
-}
-
 const ALLOWED_ORIGINS = process.env.YIELD_FRONTEND_ORIGIN
   ? [process.env.YIELD_FRONTEND_ORIGIN]
   : DEV_ORIGINS;
@@ -100,11 +92,20 @@ app.use(express.json({ limit: "20kb" }));
 
 const PORT = process.env.PORT || 3000;
 
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  console.warn(
+    "[yield-auth] JWT_SECRET is not set. Authentication endpoints will be unavailable."
+  );
+}
+
 // Model used for YIELD AI. Overridable via env var so it can be bumped
 // without a code change. gemini-3.5-flash-lite is a current, stable
 // Gemini model positioned for cost-effective, high-throughput use and
 // generous free-tier availability — a good fit for this MVP's simple
 // structured-JSON task. Structured outputs (see below) are supported.
+
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
 if (!process.env.GEMINI_API_KEY) {
