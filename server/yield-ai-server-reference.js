@@ -70,7 +70,7 @@ const corsOptions = {
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
     return callback(new Error("Not allowed by CORS"));
   },
-  methods: ["GET", "POST"],
+  methods: ["GET", "POST", "PUT"],
   credentials: false, // no cookies/auth headers used by this API
 };
 
@@ -127,11 +127,14 @@ const pool = new Pool({
 
 let dbReady = false;
 
-// Creates the farms table if it doesn't exist yet. Called once at
-// startup (see bottom of file), without blocking app.listen — if the
-// database is temporarily unavailable, we log it clearly and let
-// /api/auth/* routes report a 503 per-request, rather than crashing
-// the whole service or delaying the Gemini route from coming online.
+// Creates the farms table if it doesn't exist yet, then safely
+// migrates it forward with any new columns using ADD COLUMN IF NOT
+// EXISTS — this never touches or deletes existing rows/accounts, it
+// only widens the table. Called once at startup (see bottom of file),
+// without blocking app.listen — if the database is temporarily
+// unavailable, we log it clearly and let /api/auth/* routes report a
+// 503 per-request, rather than crashing the whole service or delaying
+// the Gemini route from coming online.
 async function initDatabase() {
   try {
     await pool.query(`
@@ -142,8 +145,23 @@ async function initDatabase() {
         created_at TIMESTAMP NOT NULL DEFAULT NOW()
       );
     `);
+
+    // Farm profile fields (from onboarding / Edit Farm). Added via
+    // ADD COLUMN IF NOT EXISTS so existing accounts are preserved as-is
+    // — new columns simply default to NULL for rows that predate them,
+    // and get filled in the next time the farmer saves their profile.
+    await pool.query(`
+      ALTER TABLE farms
+        ADD COLUMN IF NOT EXISTS farmer_name VARCHAR(150),
+        ADD COLUMN IF NOT EXISTS phone VARCHAR(30),
+        ADD COLUMN IF NOT EXISTS location VARCHAR(300),
+        ADD COLUMN IF NOT EXISTS farm_size VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS crop VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS planting_date DATE;
+    `);
+
     dbReady = true;
-    console.log("[yield-ai] Database ready — farms table available.");
+    console.log("[yield-ai] Database ready — farms table available (with profile columns).");
   } catch (err) {
     dbReady = false;
     console.error("[yield-ai] Database initialization failed — /api/auth/* will return 503 until this is resolved:", err.message);
@@ -158,9 +176,86 @@ const DUMMY_PASSWORD_HASH = bcrypt.hashSync("yield-timing-safety-placeholder", 1
 
 const MAX_FARM_NAME_LENGTH = 150;
 const MIN_PASSWORD_LENGTH = 8;
+const MAX_PROFILE_FIELD_LENGTH = 300;
 
 function signFarmToken(farmId, farmName) {
   return jwt.sign({ farmId, farmName }, JWT_SECRET, { expiresIn: "7d" });
+}
+
+// Postgres DATE columns come back from the driver as JS Date objects
+// (or null). Normalize to a plain YYYY-MM-DD string for the frontend,
+// which already works with dates in that format everywhere else.
+function formatDateOnly(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 10);
+}
+
+// Maps a `farms` row to the public JSON shape used by GET/PUT
+// /api/auth/me. Deliberately excludes password_hash — never include it
+// here, and never add it to this function.
+function toPublicFarmProfile(row) {
+  return {
+    id: row.id,
+    farmName: row.farm_name,
+    farmerName: row.farmer_name,
+    phone: row.phone,
+    location: row.location,
+    farmSize: row.farm_size,
+    crop: row.crop,
+    plantingDate: formatDateOnly(row.planting_date),
+  };
+}
+
+// Validates a PUT /api/auth/me body. Every field is optional (this is
+// a partial-update endpoint — the farmer may only be editing one
+// screen's worth of fields at a time, e.g. just location + farm size
+// from "Edit Farm"), but at least one must be present, and whatever is
+// present must be valid. Returns { updates } (a map of column -> value)
+// on success, or { error } on failure.
+const PROFILE_FIELD_TO_COLUMN = {
+  farmerName: "farmer_name",
+  phone: "phone",
+  location: "location",
+  farmSize: "farm_size",
+  crop: "crop",
+  plantingDate: "planting_date",
+};
+
+function validateProfileUpdateBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { error: "Request body must be a JSON object." };
+  }
+
+  const updates = {};
+
+  for (const [jsonKey, column] of Object.entries(PROFILE_FIELD_TO_COLUMN)) {
+    if (!(jsonKey in body)) continue;
+    const value = body[jsonKey];
+
+    if (jsonKey === "plantingDate") {
+      if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value) || Number.isNaN(Date.parse(value))) {
+        return { error: "plantingDate must be a valid date in YYYY-MM-DD format." };
+      }
+      updates[column] = value;
+      continue;
+    }
+
+    if (typeof value !== "string" || !value.trim()) {
+      return { error: `${jsonKey} must be a non-empty string.` };
+    }
+    if (value.length > MAX_PROFILE_FIELD_LENGTH) {
+      return { error: `${jsonKey} must be under ${MAX_PROFILE_FIELD_LENGTH} characters.` };
+    }
+    updates[column] = value.trim();
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return { error: "At least one field must be provided: farmerName, phone, location, farmSize, crop, plantingDate." };
+  }
+
+  return { updates };
 }
 
 // Middleware for routes that require a logged-in farm. Never reveals
@@ -372,7 +467,6 @@ app.get("/api/health", (req, res) => {
    Passwords are always hashed with bcrypt before storage and never
    read back out in any response.
 ------------------------------------------------------------------- */
-
 app.post("/api/auth/signup", async (req, res) => {
   if (!JWT_SECRET) {
     console.error("[yield-ai] /api/auth/signup called but JWT_SECRET is not configured.");
@@ -476,17 +570,60 @@ app.get("/api/auth/me", requireAuth, async (req, res) => {
   }
 
   try {
-    const result = await pool.query("SELECT id, farm_name FROM farms WHERE id = $1", [req.auth.farmId]);
+    const result = await pool.query(
+      "SELECT id, farm_name, farmer_name, phone, location, farm_size, crop, planting_date FROM farms WHERE id = $1",
+      [req.auth.farmId]
+    );
     const row = result.rows[0];
     if (!row) {
       // The account behind this token no longer exists — treat like any
       // other invalid token rather than a distinct error.
       return res.status(401).json({ error: "Invalid or missing authentication token." });
     }
-    return res.json({ ok: true, farm: { id: row.id, farmName: row.farm_name } });
+    return res.json({ ok: true, farm: toPublicFarmProfile(row) });
   } catch (err) {
     console.error("[yield-ai] /api/auth/me failed:", err.message);
     return res.status(500).json({ error: "Something went wrong. Please try again." });
+  }
+});
+
+app.put("/api/auth/me", requireAuth, async (req, res) => {
+  if (!dbReady) {
+    return res.status(503).json({ error: "Account service is temporarily unavailable. Please try again shortly." });
+  }
+
+  const { error, updates } = validateProfileUpdateBody(req.body);
+  if (error) {
+    return res.status(400).json({ error });
+  }
+
+  // Build a parameterized, dynamic SET clause from only the fields that
+  // were actually provided — never string-interpolate values, only
+  // column names, which come solely from the fixed PROFILE_FIELD_TO_COLUMN
+  // map above (never from user input) and $1 is reserved for farmId, so
+  // this can only ever update the farm identified by the verified JWT.
+  const columns = Object.keys(updates);
+  const setClause = columns.map((column, i) => `${column} = $${i + 2}`).join(", ");
+  const values = columns.map((column) => updates[column]);
+
+  try {
+    const result = await pool.query(
+      `UPDATE farms SET ${setClause} WHERE id = $1
+       RETURNING id, farm_name, farmer_name, phone, location, farm_size, crop, planting_date`,
+      [req.auth.farmId, ...values]
+    );
+
+    const row = result.rows[0];
+    if (!row) {
+      // The account behind this token no longer exists — treat like any
+      // other invalid token rather than a distinct error.
+      return res.status(401).json({ error: "Invalid or missing authentication token." });
+    }
+
+    return res.json({ ok: true, farm: toPublicFarmProfile(row) });
+  } catch (err) {
+    console.error("[yield-ai] /api/auth/me (PUT) failed:", err.message);
+    return res.status(500).json({ error: "Something went wrong updating your farm. Please try again." });
   }
 });
 
@@ -562,7 +699,6 @@ app.post("/api/yield-ai", async (req, res) => {
 
   return res.json(validated);
 });
-
 /* ----------------------------------------------------------------
    ERROR HANDLING
    Catches malformed JSON bodies, oversized payloads, and anything
