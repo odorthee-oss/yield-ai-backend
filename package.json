@@ -10,12 +10,12 @@
     "node": ">=18"
   },
   "dependencies": {
-  "express": "^4.19.2",
-  "@google/genai": "^2.17.1",
-  "cors": "^2.8.5",
-  "bcryptjs": "^3.0.2",
-  "jsonwebtoken": "^9.0.2",
-  "pg": "^8.16.3"
+    "express": "^4.19.2",
+    "@google/genai": "^2.17.1",
+    "cors": "^2.8.5",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.1"
   },
   "license": "UNLICENSED",
   "private": true
