@@ -20,23 +20,14 @@
 
 const express = require("express");
 const cors = require("cors");
+const { GoogleGenAI } = require("@google/genai");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
 const { randomUUID } = require("crypto");
-const { GoogleGenAI } = require("@google/genai");
 
 const app = express();
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL
-    ? { rejectUnauthorized: false }
-    : false,
-});
 
-pool.on("error", (err) => {
-  console.error("[yield-auth] Unexpected PostgreSQL pool error:", err);
-});
 /* ----------------------------------------------------------------
    CORS
    The frontend and backend are deployed on separate domains, so the
@@ -92,20 +83,11 @@ app.use(express.json({ limit: "20kb" }));
 
 const PORT = process.env.PORT || 3000;
 
-const JWT_SECRET = process.env.JWT_SECRET;
-
-if (!JWT_SECRET) {
-  console.warn(
-    "[yield-auth] JWT_SECRET is not set. Authentication endpoints will be unavailable."
-  );
-}
-
 // Model used for YIELD AI. Overridable via env var so it can be bumped
 // without a code change. gemini-3.5-flash-lite is a current, stable
 // Gemini model positioned for cost-effective, high-throughput use and
 // generous free-tier availability — a good fit for this MVP's simple
 // structured-JSON task. Structured outputs (see below) are supported.
-
 const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
 if (!process.env.GEMINI_API_KEY) {
@@ -117,6 +99,92 @@ if (!process.env.GEMINI_API_KEY) {
 const genAI = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY, // set on the server / hosting platform, never in frontend code
 });
+
+/* ----------------------------------------------------------------
+   AUTH / DATABASE SETUP (V1)
+   Farm-name-based account identity, backed by Postgres. Nothing in
+   this block is used by /api/yield-ai — the AI route has no
+   dependency on the database or on authentication succeeding.
+------------------------------------------------------------------- */
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  // Don't crash on boot — /api/yield-ai and /api/health must keep
+  // working even if auth isn't configured yet. Every /api/auth/* route
+  // checks this itself and returns a generic 500 rather than exposing
+  // the missing-secret detail or throwing.
+  console.warn("[yield-ai] JWT_SECRET is not set. /api/auth/* will return a generic server error until it is configured.");
+}
+
+// DATABASE_URL is expected to be a standard Postgres connection string
+// (e.g. Render's managed Postgres). SSL is enabled whenever a connection
+// string is present, matching Render's requirements; never logged or
+// exposed in any response.
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+});
+
+let dbReady = false;
+
+// Creates the farms table if it doesn't exist yet. Called once at
+// startup (see bottom of file), without blocking app.listen — if the
+// database is temporarily unavailable, we log it clearly and let
+// /api/auth/* routes report a 503 per-request, rather than crashing
+// the whole service or delaying the Gemini route from coming online.
+async function initDatabase() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS farms (
+        id UUID PRIMARY KEY,
+        farm_name VARCHAR(150) UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+      );
+    `);
+    dbReady = true;
+    console.log("[yield-ai] Database ready — farms table available.");
+  } catch (err) {
+    dbReady = false;
+    console.error("[yield-ai] Database initialization failed — /api/auth/* will return 503 until this is resolved:", err.message);
+  }
+}
+
+// Precomputed once at startup and used only as a stand-in hash when a
+// login attempt targets an unknown farm name, so bcrypt.compare() still
+// runs and login's response timing doesn't reveal whether the farm name
+// exists. Not a real credential.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync("yield-timing-safety-placeholder", 10);
+
+const MAX_FARM_NAME_LENGTH = 150;
+const MIN_PASSWORD_LENGTH = 8;
+
+function signFarmToken(farmId, farmName) {
+  return jwt.sign({ farmId, farmName }, JWT_SECRET, { expiresIn: "7d" });
+}
+
+// Middleware for routes that require a logged-in farm. Never reveals
+// *why* a token was rejected (expired vs malformed vs wrong secret) —
+// always the same generic 401.
+function requireAuth(req, res, next) {
+  if (!JWT_SECRET) {
+    console.error("[yield-ai] Auth-protected route called but JWT_SECRET is not configured.");
+    return res.status(500).json({ error: "Server configuration error. Please try again later." });
+  }
+
+  const authHeader = req.headers.authorization || "";
+  const [scheme, token] = authHeader.split(" ");
+  if (scheme !== "Bearer" || !token) {
+    return res.status(401).json({ error: "Invalid or missing authentication token." });
+  }
+
+  try {
+    req.auth = jwt.verify(token, JWT_SECRET); // { farmId, farmName, iat, exp }
+    return next();
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid or missing authentication token." });
+  }
+}
 
 /* ----------------------------------------------------------------
    SYSTEM PROMPT
@@ -289,7 +357,137 @@ function validateYieldResponse(data) {
 // Simple liveness check — useful for confirming a deploy went live
 // before pointing the frontend at it.
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", provider: "gemini", model: MODEL, configured: Boolean(process.env.GEMINI_API_KEY) });
+  res.json({
+    status: "ok",
+    provider: "gemini",
+    model: MODEL,
+    configured: Boolean(process.env.GEMINI_API_KEY),
+    database: dbReady ? "connected" : "unavailable",
+  });
+});
+
+/* ----------------------------------------------------------------
+   AUTH ROUTES (V1)
+   Farm-name-based signup/login/session, backed by the farms table.
+   Passwords are always hashed with bcrypt before storage and never
+   read back out in any response.
+------------------------------------------------------------------- */
+
+app.post("/api/auth/signup", async (req, res) => {
+  if (!JWT_SECRET) {
+    console.error("[yield-ai] /api/auth/signup called but JWT_SECRET is not configured.");
+    return res.status(500).json({ error: "Server configuration error. Please try again later." });
+  }
+  if (!dbReady) {
+    console.error("[yield-ai] /api/auth/signup called but the database is not ready.");
+    return res.status(503).json({ error: "Account service is temporarily unavailable. Please try again shortly." });
+  }
+
+  const body = req.body || {};
+  const farmName = typeof body.farmName === "string" ? body.farmName.trim() : "";
+  const password = typeof body.password === "string" ? body.password : "";
+
+  if (!farmName) {
+    return res.status(400).json({ error: "farmName is required." });
+  }
+  if (farmName.length > MAX_FARM_NAME_LENGTH) {
+    return res.status(400).json({ error: `farmName must be under ${MAX_FARM_NAME_LENGTH} characters.` });
+  }
+  if (!password) {
+    return res.status(400).json({ error: "password is required." });
+  }
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    return res.status(400).json({ error: `password must be at least ${MIN_PASSWORD_LENGTH} characters.` });
+  }
+
+  try {
+    const existing = await pool.query("SELECT id FROM farms WHERE farm_name = $1", [farmName]);
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: "A farm with this name is already registered." });
+    }
+
+    // NEVER store the plaintext password — only its bcrypt hash.
+    const passwordHash = await bcrypt.hash(password, 10);
+    const id = randomUUID();
+
+    await pool.query("INSERT INTO farms (id, farm_name, password_hash) VALUES ($1, $2, $3)", [id, farmName, passwordHash]);
+
+    const token = signFarmToken(id, farmName);
+    return res.status(201).json({ ok: true, token, farm: { id, farmName } });
+  } catch (err) {
+    // A concurrent signup could race past the SELECT check above; the
+    // UNIQUE constraint on farm_name is the real guard against that.
+    if (err && err.code === "23505") {
+      return res.status(409).json({ error: "A farm with this name is already registered." });
+    }
+    // Never log the password, never leak err.message/stack to the client.
+    console.error("[yield-ai] /api/auth/signup failed:", err.message);
+    return res.status(500).json({ error: "Something went wrong creating your account. Please try again." });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  if (!JWT_SECRET) {
+    console.error("[yield-ai] /api/auth/login called but JWT_SECRET is not configured.");
+    return res.status(500).json({ error: "Server configuration error. Please try again later." });
+  }
+  if (!dbReady) {
+    console.error("[yield-ai] /api/auth/login called but the database is not ready.");
+    return res.status(503).json({ error: "Account service is temporarily unavailable. Please try again shortly." });
+  }
+
+  const body = req.body || {};
+  const farmName = typeof body.farmName === "string" ? body.farmName.trim() : "";
+  const password = typeof body.password === "string" ? body.password : "";
+  const invalidCredentials = { error: "Invalid farm name or password." };
+
+  if (!farmName || !password) {
+    return res.status(400).json(invalidCredentials);
+  }
+
+  try {
+    const result = await pool.query("SELECT id, farm_name, password_hash FROM farms WHERE farm_name = $1", [farmName]);
+    const row = result.rows[0];
+
+    // Always run bcrypt.compare — against the real hash if the farm
+    // exists, or a precomputed dummy hash if it doesn't — so an unknown
+    // farm name and a wrong password take the same amount of time and
+    // can't be told apart by response timing.
+    const hashToCheck = row ? row.password_hash : DUMMY_PASSWORD_HASH;
+    const passwordMatches = await bcrypt.compare(password, hashToCheck);
+
+    if (!row || !passwordMatches) {
+      // Deliberately identical response for "no such farm" and "wrong
+      // password" — never reveal which one it was.
+      return res.status(401).json(invalidCredentials);
+    }
+
+    const token = signFarmToken(row.id, row.farm_name);
+    return res.json({ ok: true, token, farm: { id: row.id, farmName: row.farm_name } });
+  } catch (err) {
+    console.error("[yield-ai] /api/auth/login failed:", err.message);
+    return res.status(500).json({ error: "Something went wrong logging in. Please try again." });
+  }
+});
+
+app.get("/api/auth/me", requireAuth, async (req, res) => {
+  if (!dbReady) {
+    return res.status(503).json({ error: "Account service is temporarily unavailable. Please try again shortly." });
+  }
+
+  try {
+    const result = await pool.query("SELECT id, farm_name FROM farms WHERE id = $1", [req.auth.farmId]);
+    const row = result.rows[0];
+    if (!row) {
+      // The account behind this token no longer exists — treat like any
+      // other invalid token rather than a distinct error.
+      return res.status(401).json({ error: "Invalid or missing authentication token." });
+    }
+    return res.json({ ok: true, farm: { id: row.id, farmName: row.farm_name } });
+  } catch (err) {
+    console.error("[yield-ai] /api/auth/me failed:", err.message);
+    return res.status(500).json({ error: "Something went wrong. Please try again." });
+  }
 });
 
 app.post("/api/yield-ai", async (req, res) => {
@@ -385,7 +583,11 @@ app.use((err, req, res, next) => {
   return res.status(500).json({ error: "Something went wrong. Please try again." });
 });
 
+// Kick off DB initialization in the background — deliberately not
+// awaited, so a slow or unavailable database never delays the server
+// from accepting requests, and /api/yield-ai is never gated on it.
+initDatabase();
+
 app.listen(PORT, () => console.log(`[yield-ai] listening on port ${PORT} (model: ${MODEL})`));
 
 module.exports = app;
-
